@@ -14,7 +14,7 @@
  *     ever returned as a stream if its album also matches the YT Music
  *     album — title/artist/duration alone are not sufficient (see
  *     pickBest below).
- *   - Muzo (hf.space): matched directly by videoId (no fuzzy matching
+ *   - Muzo: matched directly by videoId (no fuzzy matching
  *     needed), giving an AAC stream + a lossless stream.
  *
  * Usage:
@@ -739,14 +739,14 @@ async function fetchSaavnStream(title, artistNames, ytDurationText, albumName, d
   };
 }
 
-// ---------- Muzo (hf.space) ----------
+// ---------- Muzo ----------
 //
 // Unlike JioSaavn, this is matched directly by videoId — no title/artist/
 // duration fuzzy matching needed since the lookup is exact.
 
 async function fetchMuzoStream(videoId) {
   const response = await fetch(
-    `https://shashwatidr-casquad.hf.space/api/stream?id=${encodeURIComponent(videoId)}`
+    `https://secret.com/api/stream?id=${encodeURIComponent(videoId)}`
   );
 
   if (!response.ok) {

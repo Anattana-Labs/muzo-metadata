@@ -2,25 +2,21 @@
  * Cloudflare Worker: YouTube Music track metadata + matched JioSaavn stream
  *
  * ZERO-DEPENDENCY VERSION — no `npm install`, no imports at all.
- * The DES-ECB decrypt needed for JioSaavn's encrypted_media_url is
- * implemented inline below in plain JS (single-file, ~120 lines),
- * so this can be pasted straight into the Cloudflare dashboard's
- * Quick Edit box, or deployed with `wrangler deploy` with no
- * package.json / node_modules required either way.
+ * JioSaavn matching/decryption is now delegated entirely to the
+ * fast-saavn.vercel.app API (GET /?title=...&artist=...&duration=...),
+ * which returns the media id/path as plain text. No DES decryption or
+ * custom fuzzy-matching logic lives in this file anymore.
  *
  * Looks up the same track on two sources in parallel:
- *   - JioSaavn: matched by title/artist/duration/album (fuzzy), stream URL
- *     recovered by decrypting its encrypted_media_url. A candidate is only
- *     ever returned as a stream if its album also matches the YT Music
- *     album — title/artist/duration alone are not sufficient (see
- *     pickBest below).
- *   - Muzo: matched directly by videoId (no fuzzy matching
+ *   - JioSaavn (via fast-saavn.vercel.app): matched by title/artist/
+ *     duration, returns a media id/path that we turn into a stream URL.
+ *   - Muzo (hf.space): matched directly by videoId (no fuzzy matching
  *     needed), giving an AAC stream + a lossless stream.
  *
  * Usage:
  *   GET /?videoId=YfqJktv2nuA
  *   GET /?videoId=YfqJktv2nuA&stream=0   (returns an error — nothing else is returned)
- *   GET /?videoId=YfqJktv2nuA&debug=1    (also returns JioSaavn's raw search response(s))
+ *   GET /?videoId=YfqJktv2nuA&debug=1    (also returns the fast-saavn request URL/response)
  *
  *   GET /v1/?videoId=YfqJktv2nuA
  *     Same response as the root endpoint, except each entry in
@@ -32,6 +28,7 @@
 const INNERTUBE_API_KEY = "AIzaSyC9XL3ZjWddXya6X74dJoCTL-WEYFDNX30";
 const CLIENT_VERSION = "1.20260825.00.00";
 const SAAVN_QUALITY = "320"; // 96 | 160 | 320
+const FAST_SAAVN_BASE_URL = "https://fast-saavn.vercel.app/";
 
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
@@ -119,9 +116,7 @@ export default {
         metadata.title,
         metadata.artists.map((a) => a.name),
         metadata.duration,
-        metadata.album?.name,
-        debug,
-        false // artist avatars now come from YT Music (metadata.artists), not JioSaavn
+        debug
       ),
       fetchMuzoStream(videoId),
       includeArtistImages ? fetchYtmArtists(metadata.artists) : Promise.resolve(null),
@@ -289,197 +284,6 @@ function extractMetadata(renderer, videoId) {
   };
 }
 
-// ---------- Pure-JS DES-ECB (no dependencies) ----------
-//
-// Minimal, single-purpose DES implementation: decrypt-only, ECB mode,
-// PKCS7-unpad. This is the classic DES algorithm (Feistel network,
-// IP/FP + PC1/PC2 permutations, S-boxes) written directly against the
-// standard tables — no external library, no node:crypto (whose Workers
-// polyfill doesn't support legacy DES ciphers anyway).
-
-const DES_PC1 = [
-  57,49,41,33,25,17,9,1,58,50,42,34,26,18,10,2,59,51,43,35,27,19,11,3,60,52,44,36,
-  63,55,47,39,31,23,15,7,62,54,46,38,30,22,14,6,61,53,45,37,29,21,13,5,28,20,12,4,
-];
-const DES_PC2 = [
-  14,17,11,24,1,5,3,28,15,6,21,10,23,19,12,4,26,8,16,7,27,20,13,2,
-  41,52,31,37,47,55,30,40,51,45,33,48,44,49,39,56,34,53,46,42,50,36,29,32,
-];
-const DES_SHIFTS = [1,1,2,2,2,2,2,2,1,2,2,2,2,2,2,1];
-const DES_IP = [
-  58,50,42,34,26,18,10,2,60,52,44,36,28,20,12,4,62,54,46,38,30,22,14,6,64,56,48,40,32,24,16,8,
-  57,49,41,33,25,17,9,1,59,51,43,35,27,19,11,3,61,53,45,37,29,21,13,5,63,55,47,39,31,23,15,7,
-];
-const DES_FP = [
-  40,8,48,16,56,24,64,32,39,7,47,15,55,23,63,31,38,6,46,14,54,22,62,30,37,5,45,13,53,21,61,29,
-  36,4,44,12,52,20,60,28,35,3,43,11,51,19,59,27,34,2,42,10,50,18,58,26,33,1,41,9,49,17,57,25,
-];
-const DES_E = [
-  32,1,2,3,4,5,4,5,6,7,8,9,8,9,10,11,12,13,12,13,14,15,16,17,
-  16,17,18,19,20,21,20,21,22,23,24,25,24,25,26,27,28,29,28,29,30,31,32,1,
-];
-const DES_P = [16,7,20,21,29,12,28,17,1,15,23,26,5,18,31,10,2,8,24,14,32,27,3,9,19,13,30,6,22,11,4,25];
-const DES_SBOX = [
-  [14,4,13,1,2,15,11,8,3,10,6,12,5,9,0,7,0,15,7,4,14,2,13,1,10,6,12,11,9,5,3,8,
-   4,1,14,8,13,6,2,11,15,12,9,7,3,10,5,0,15,12,8,2,4,9,1,7,5,11,3,14,10,0,6,13],
-  [15,1,8,14,6,11,3,4,9,7,2,13,12,0,5,10,3,13,4,7,15,2,8,14,12,0,1,10,6,9,11,5,
-   0,14,7,11,10,4,13,1,5,8,12,6,9,3,2,15,13,8,10,1,3,15,4,2,11,6,7,12,0,5,14,9],
-  [10,0,9,14,6,3,15,5,1,13,12,7,11,4,2,8,13,7,0,9,3,4,6,10,2,8,5,14,12,11,15,1,
-   13,6,4,9,8,15,3,0,11,1,2,12,5,10,14,7,1,10,13,0,6,9,8,7,4,15,14,3,11,5,2,12],
-  [7,13,14,3,0,6,9,10,1,2,8,5,11,12,4,15,13,8,11,5,6,15,0,3,4,7,2,12,1,10,14,9,
-   10,6,9,0,12,11,7,13,15,1,3,14,5,2,8,4,3,15,0,6,10,1,13,8,9,4,5,11,12,7,2,14],
-  [2,12,4,1,7,10,11,6,8,5,3,15,13,0,14,9,14,11,2,12,4,7,13,1,5,0,15,10,3,9,8,6,
-   4,2,1,11,10,13,7,8,15,9,12,5,6,3,0,14,11,8,12,7,1,14,2,13,6,15,0,9,10,4,5,3],
-  [12,1,10,15,9,2,6,8,0,13,3,4,14,7,5,11,10,15,4,2,7,12,9,5,6,1,13,14,0,11,3,8,
-   9,14,15,5,2,8,12,3,7,0,4,10,1,13,11,6,4,3,2,12,9,5,15,10,11,14,1,7,6,0,8,13],
-  [4,11,2,14,15,0,8,13,3,12,9,7,5,10,6,1,13,0,11,7,4,9,1,10,14,3,5,12,2,15,8,6,
-   1,4,11,13,12,3,7,14,10,15,6,8,0,5,9,2,6,11,13,8,1,4,10,7,9,5,0,15,14,2,3,12],
-  [13,2,8,4,6,15,11,1,10,9,3,14,5,0,12,7,1,15,13,8,10,3,7,4,12,5,6,11,0,14,9,2,
-   7,11,4,1,9,12,14,2,0,6,10,13,15,3,5,8,2,1,14,7,4,10,8,13,15,12,9,0,3,5,6,11],
-];
-
-function bytesToBits(bytes) {
-  const bits = new Array(bytes.length * 8);
-  for (let i = 0; i < bytes.length; i++) {
-    for (let b = 0; b < 8; b++) bits[i * 8 + b] = (bytes[i] >> (7 - b)) & 1;
-  }
-  return bits;
-}
-function bitsToBytes(bits) {
-  const bytes = new Array(bits.length / 8).fill(0);
-  for (let i = 0; i < bits.length; i++) {
-    bytes[i >> 3] |= bits[i] << (7 - (i & 7));
-  }
-  return bytes;
-}
-function permute(bits, table) {
-  return table.map((pos) => bits[pos - 1]);
-}
-function leftShift(bits, n) {
-  return bits.slice(n).concat(bits.slice(0, n));
-}
-function desSubKeys(keyBytes) {
-  let keyBits = permute(bytesToBits(keyBytes), DES_PC1); // 56 bits
-  let c = keyBits.slice(0, 28);
-  let d = keyBits.slice(28);
-  const subKeys = [];
-  for (let round = 0; round < 16; round++) {
-    c = leftShift(c, DES_SHIFTS[round]);
-    d = leftShift(d, DES_SHIFTS[round]);
-    subKeys.push(permute(c.concat(d), DES_PC2)); // 48 bits
-  }
-  return subKeys;
-}
-function feistel(rBits, subKey) {
-  const expanded = permute(rBits, DES_E); // 48 bits
-  const xored = expanded.map((b, i) => b ^ subKey[i]);
-  let sboxOut = [];
-  for (let s = 0; s < 8; s++) {
-    const chunk = xored.slice(s * 6, s * 6 + 6);
-    const row = (chunk[0] << 1) | chunk[5];
-    const col = (chunk[1] << 3) | (chunk[2] << 2) | (chunk[3] << 1) | chunk[4];
-    const val = DES_SBOX[s][row * 16 + col];
-    sboxOut = sboxOut.concat([(val >> 3) & 1, (val >> 2) & 1, (val >> 1) & 1, val & 1]);
-  }
-  return permute(sboxOut, DES_P); // 32 bits
-}
-// Decrypt a single 8-byte block with a single 8-byte DES key.
-function desDecryptBlock(blockBytes, keyBytes) {
-  const subKeys = desSubKeys(keyBytes);
-  let bits = permute(bytesToBits(blockBytes), DES_IP);
-  let l = bits.slice(0, 32);
-  let r = bits.slice(32);
-  // Decryption uses subkeys in reverse order.
-  for (let round = 15; round >= 0; round--) {
-    const newL = r;
-    const fOut = feistel(r, subKeys[round]);
-    const newR = l.map((b, i) => b ^ fOut[i]);
-    l = newL;
-    r = newR;
-  }
-  return bitsToBytes(r.concat(l).concat([]).length ? permute(r.concat(l), DES_FP) : []);
-}
-
-const base64ToBytes = (b64) => {
-  const binary = atob(b64);
-  const bytes = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-  return bytes;
-};
-
-const decryptMediaUrl = (encryptedMediaUrl) => {
-  if (!encryptedMediaUrl) return "";
-
-  try {
-    const keyBytes = [...new TextEncoder().encode('38346591')]; // 8-byte DES key
-    const cipherBytes = base64ToBytes(encryptedMediaUrl);
-
-    let out = [];
-    for (let i = 0; i < cipherBytes.length; i += 8) {
-      const block = [...cipherBytes.subarray(i, i + 8)];
-      out = out.concat(desDecryptBlock(block, keyBytes));
-    }
-
-    // Strip PKCS7 padding from the end.
-    const padLen = out[out.length - 1];
-    if (padLen >= 1 && padLen <= 8) out = out.slice(0, out.length - padLen);
-
-    const decoded = new TextDecoder().decode(new Uint8Array(out));
-    return decoded.trim().replace('http:', 'https:');
-  } catch (err) {
-    console.error("Saavn decryptMediaUrl failed:", err.message || err);
-    return "";
-  }
-};
-
-// ---------- Artist avatar images (JioSaavn — legacy, no longer used by /v1) ----------
-//
-// /v1 now gets artist avatars from YT Music (see fetchYtmArtists below).
-// These helpers are kept only because createArtistPayload still references
-// them; they're inactive since fetchSaavnStream is called with
-// includeArtistImages = false. Safe to delete along with the
-// `includeImages` plumbing if you want the file tidier.
-const ARTIST_IMAGE_QUALITIES = [
-  { quality: "50x50", width: 50, height: 50 },
-  { quality: "150x150", width: 150, height: 150 },
-  { quality: "500x500", width: 500, height: 500 },
-  { quality: "544x544", width: 544, height: 544 },
-];
-
-function getArtistImageLinks(imageUrl) {
-  if (!imageUrl) return [];
-  return ARTIST_IMAGE_QUALITIES.map(({ quality, width, height }) => ({
-    quality,
-    width,
-    height,
-    url: imageUrl.replace(/\d+x\d+/, quality),
-  }));
-}
-
-const createArtistPayload = (artist, includeImages = false) => ({
-  id: artist.id,
-  name: artist.name,
-  role: artist.role,
-  type: artist.type,
-  url: artist.perma_url,
-  ...(includeImages ? { image: getArtistImageLinks(artist.image) } : {}),
-});
-
-const createSongPayload = (song, includeArtistImages = false) => {
-  const info = song.more_info;
-  return {
-    id: song.id,
-    name: song.title,
-    duration: info?.duration ? Number(info.duration) : null,
-    artists: {
-      primary: info?.artistMap?.primary_artists?.map((a) => createArtistPayload(a, includeArtistImages)) || [],
-      featured: info?.artistMap?.featured_artists?.map((a) => createArtistPayload(a, includeArtistImages)) || [],
-      all: info?.artistMap?.artists?.map((a) => createArtistPayload(a, includeArtistImages)) || [],
-    },
-    downloadUrl: decryptMediaUrl(info?.encrypted_media_url),
-  };
-};
-
 // Parses either "3:42" or "3:42.5..." style or a plain numeric string of
 // seconds (YT's lengthText is always mm:ss / h:mm:ss).
 const parseDurationToSeconds = (durationStr) => {
@@ -511,242 +315,78 @@ const straightenQuotes = (str) =>
 
 const cleanForCompare = (str) => clean(straightenQuotes(str));
 
-async function searchJioSaavn(query) {
-  // JioSaavn's search.getResults pages start at 1, not 0 — p=0 silently
-  // returns a shifted/invalid window that can drop the actual top hit
-  // (which is exactly what was happening: the correct original track never
-  // showed up in results at all, at any tier, because it was paginated out
-  // before our matching logic ever saw it).
-  //
-  // Param order/set matches the exact request JioSaavn's own web client
-  // sends (p, q, _format, _marker, api_version, ctx, n, __call).
-  const params = new URLSearchParams();
-  params.set('p', '1');
-  params.set('q', query);
-  params.set('_format', 'json');
-  params.set('_marker', '0');
-  params.set('api_version', '4');
-  params.set('ctx', 'web6dot0');
-  params.set('n', '20');
-  params.set('__call', 'search.getResults');
-  const jioSaavnApiUrl = `https://www.jiosaavn.com/api.php?${params.toString()}`;
+// ---------- JioSaavn stream (via fast-saavn.vercel.app) ----------
+//
+// All title/artist/duration matching and encrypted_media_url decryption
+// is delegated to fast-saavn.vercel.app. It takes title/artist/duration
+// query params and returns the matched media id/path as plain text (e.g.
+// "342/65e9f0a2e7c9f3e4e9b9f9a2e7c9f3e4"), which we turn into a full
+// stream URL by appending "_<quality>.mp4" and prefixing the CDN host.
 
-  const response = await fetch(jioSaavnApiUrl, {
-    headers: {
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36',
-      'Referer': 'https://www.jiosaavn.com/',
-    },
-  });
-
-  if (!response.ok) {
-    const errorText = await response.text();
-    throw new Error(`JioSaavn API returned ${response.status}: ${errorText}`);
-  }
-
-  const data = await response.json();
-  return { url: jioSaavnApiUrl, results: data.results || [], raw: data };
-}
-
-async function fetchSaavnStream(title, artistNames, ytDurationText, albumName, debug = false, includeArtistImages = false) {
+async function fetchSaavnStream(title, artistNames, ytDurationText, debug = false) {
   const primaryArtist = artistNames[0] || '';
-  const cleanedTitle = title.replace(/\(.*?\)/g, '').trim();
+  const durationSeconds = parseDurationToSeconds(ytDurationText);
 
-  const targetDurationSeconds = parseDurationToSeconds(ytDurationText);
-  const normalizedYtArtists = artistNames
-    .map((n) => normalizeString(n).toLowerCase())
-    .filter((n) => n.length > 0); // drop blanks so they can't false-match via startsWith('')
-
-  const matchName = (normSaavn, ytName) =>
-    normSaavn.startsWith(ytName) || ytName.startsWith(normSaavn);
-  const anyMatch = (saavnNames, ytNames) =>
-    saavnNames.length > 0 && ytNames.length > 0 && saavnNames.some((s) => ytNames.some((y) => matchName(s, y)));
-
-  const evaluate = (track) => {
-    const primaryArtists = track.artists?.primary?.map((a) => a.name.trim()) || [];
-    const featuredArtists = track.artists?.featured?.map((a) => a.name.trim()) || [];
-    const singers = track.artists?.all?.filter((a) => a.role === 'singer').map((a) => a.name.trim()) || [];
-    const writerCredits = track.artists?.all
-      ?.filter((a) => a.role === 'music' || a.role === 'lyricist')
-      .map((a) => a.name.trim()) || [];
-
-    const normalize = (arr) =>
-      [...new Set(arr)].map((n) => normalizeString(n).toLowerCase()).filter((n) => n.length > 0);
-
-    // Two tiers, since JioSaavn keeps the ORIGINAL songwriter's "music"/"lyricist"
-    // credit on remixes, covers, and reworks even when a completely different
-    // artist performs them (a "(Remix)" by Artist B still lists Artist A as
-    // composer). A match on writer credits alone isn't reliable evidence this
-    // is the same recording — but on some legitimately-tagged tracks it's the
-    // ONLY credit JioSaavn has, so it's still useful as a last resort.
-    //   strong = matches via primary/featured artist or the actual "singer" role
-    //   weak   = matches only via the composer/writer ("music"/"lyricist") role
-    const strongPool = normalize([...primaryArtists, ...featuredArtists, ...singers]);
-    const weakPool = normalize(writerCredits);
-
-    const strongArtistMatch = anyMatch(strongPool, normalizedYtArtists);
-    const weakArtistMatch = !strongArtistMatch && anyMatch(weakPool, normalizedYtArtists);
-
-    const titleMatches = cleanForCompare(track.name).startsWith(cleanForCompare(title));
-
-    // Album match. Now REQUIRED (not just a tiebreaker) — a remix/cover/
-    // rework is almost always released under a different album than the
-    // original, even when title, duration, and (via a writer credit) an
-    // artist name all happen to line up. If we can't confirm the album,
-    // we don't return a stream for that candidate at all (see pickBest).
-    const albumMatches =
-      !!albumName &&
-      !!track.albumName &&
-      cleanForCompare(track.albumName).includes(cleanForCompare(albumName));
-
-    let durationDiff = null;
-    let durationMatches = true;
-    if (targetDurationSeconds !== null && track.duration !== null) {
-      durationDiff = Math.abs(track.duration - targetDurationSeconds);
-      durationMatches = durationDiff <= 2;
-    } else if (targetDurationSeconds !== null) {
-      durationMatches = false;
-    }
-
-    return { titleMatches, strongArtistMatch, weakArtistMatch, albumMatches, durationMatches, durationDiff };
-  };
-
-  // Pick the best candidate out of a pool: title + duration + artist
-  // (strong tier preferred over weak tier) are necessary but no longer
-  // sufficient — the album must also match, or we return no track at all
-  // rather than risk serving a remix/cover/rework's stream under the
-  // original's metadata.
-  const pickBest = (pool) => {
-    const passesBase = (track) => {
-      const r = evaluate(track);
-      return r.titleMatches && r.durationMatches;
-    };
-    const strongCandidates = pool.filter((t) => passesBase(t) && evaluate(t).strongArtistMatch);
-    const strongAlbumMatch = strongCandidates.find((t) => evaluate(t).albumMatches);
-    if (strongAlbumMatch) {
-      return { track: strongAlbumMatch, tier: "strong" };
-    }
-
-    const weakCandidates = pool.filter((t) => passesBase(t) && evaluate(t).weakArtistMatch);
-    const weakAlbumMatch = weakCandidates.find((t) => evaluate(t).albumMatches);
-    if (weakAlbumMatch) {
-      return { track: weakAlbumMatch, tier: "weak" };
-    }
-
-    // Title/duration/artist matched something, but none of those
-    // candidates also matched on album — refuse to guess.
-    const hadArtistMatchWithoutAlbum = strongCandidates.length > 0 || weakCandidates.length > 0;
-    return { track: null, tier: null, albumBlocked: hadArtistMatchWithoutAlbum };
-  };
-
-  // Query attempts, from narrowest to widest. The narrow query (title +
-  // primary artist) is usually enough, but JioSaavn's own search relevance
-  // can sometimes fail to surface the original at all for a given query
-  // string — so if the narrow query doesn't produce a strong match, widen
-  // with a title-only search and merge the pools before giving up.
-  const queries = [
-    `${cleanedTitle} ${primaryArtist}`.trim(),
-    cleanedTitle,
-  ];
-
-  const seenIds = new Set();
-  const pool = [];
-  const queriesTried = [];
-  const rawResponses = []; // always collected; only returned to the caller when debug=true
-  let best = { track: null, tier: null, albumBlocked: false };
-
-  for (const query of queries) {
-    let searchResult;
-    try {
-      searchResult = await searchJioSaavn(query);
-    } catch (err) {
-      searchResult = { url: null, results: [], raw: { error: String(err) } };
-    }
-    queriesTried.push(searchResult.url || query);
-    rawResponses.push({ query, url: searchResult.url, raw: searchResult.raw });
-
-    for (const song of searchResult.results) {
-      if (seenIds.has(song.id)) continue;
-      seenIds.add(song.id);
-      const processed = createSongPayload(song, includeArtistImages);
-      processed.albumName = song.more_info?.album || null;
-      pool.push(processed);
-    }
-
-    best = pickBest(pool);
-    if (best.tier === "strong") break; // good enough — stop widening
+  const params = new URLSearchParams();
+  params.set('title', title);
+  params.set('artist', primaryArtist);
+  // fast-saavn accepts either "3:45" or a raw second count; prefer the
+  // parsed second count when we have one, otherwise fall back to
+  // whatever YT gave us verbatim.
+  if (durationSeconds !== null) {
+    params.set('duration', String(durationSeconds));
+  } else if (ytDurationText) {
+    params.set('duration', ytDurationText);
   }
 
-  if (pool.length === 0) {
+  const apiUrl = `${FAST_SAAVN_BASE_URL}?${params.toString()}`;
+
+  let response;
+  try {
+    response = await fetch(apiUrl, {
+      headers: { "User-Agent": "Mozilla/5.0" },
+    });
+  } catch (err) {
     return {
       matched: false,
-      reason: "No JioSaavn search results",
-      ...(debug
-        ? { debug: { target: { title, artistNames, targetDurationSeconds, albumName }, queriesTried, rawResponses } }
-        : {}),
+      reason: "fast-saavn request failed",
+      ...(debug ? { debug: { url: apiUrl, error: String(err) } } : {}),
     };
   }
 
-  const matchingTrack = best.track;
-  const matchTier = best.tier;
-  const reason = !matchingTrack
-    ? (best.albumBlocked
-        ? "Title/artist/duration matched a candidate, but its album didn't match — refusing to guess"
-        : "No candidate matched on title, duration, and artist")
-    : undefined;
-
-  const debugInfo = debug
-    ? {
-        target: { title, artistNames, targetDurationSeconds, albumName },
-        queriesTried,
-        rawResponses,
-        chosenId: matchingTrack ? matchingTrack.id : null,
-        matchTier,
-        reason,
-        candidates: pool.map((t) => {
-          const r = evaluate(t);
-          return {
-            id: t.id,
-            name: t.name,
-            album: t.albumName,
-            duration: t.duration,
-            titleMatches: r.titleMatches,
-            strongArtistMatch: r.strongArtistMatch,
-            weakArtistMatch: r.weakArtistMatch,
-            albumMatches: r.albumMatches,
-            durationMatches: r.durationMatches,
-            durationDiff: r.durationDiff,
-          };
-        }),
-      }
-    : undefined;
-
-  if (!matchingTrack || !matchingTrack.downloadUrl) {
-    return debug ? { matched: null, reason, debug: debugInfo } : { matched: null, reason };
+  if (!response.ok) {
+    return {
+      matched: false,
+      reason: `fast-saavn returned ${response.status}`,
+      ...(debug ? { debug: { url: apiUrl, status: response.status } } : {}),
+    };
   }
 
-  // The decrypted URL looks like https://aac.saavncdn.com/<id>_<bitrate>.mp4
-  // Strip the bitrate suffix so we can pick our own quality.
-  const trimmedId = matchingTrack.downloadUrl.replace(
-    /^https:\/\/aac\.saavncdn\.com\/(.*?)_\d+\.mp4$/,
-    '$1'
-  );
+  const mediaPath = (await response.text()).trim();
+
+  if (!mediaPath) {
+    return {
+      matched: false,
+      reason: "No JioSaavn match from fast-saavn",
+      ...(debug ? { debug: { url: apiUrl } } : {}),
+    };
+  }
 
   return {
-    streamId: trimmedId,
-    streamUrl: `https://aac.saavncdn.com/${trimmedId}_${SAAVN_QUALITY}.mp4`,
-    artists: matchingTrack.artists,
-    ...(debug ? { debug: debugInfo } : {}),
+    streamId: mediaPath,
+    streamUrl: `https://aac.saavncdn.com/${mediaPath}_${SAAVN_QUALITY}.mp4`,
+    ...(debug ? { debug: { url: apiUrl, mediaPath } } : {}),
   };
 }
 
-// ---------- Muzo ----------
+// ---------- Muzo (hf.space) ----------
 //
 // Unlike JioSaavn, this is matched directly by videoId — no title/artist/
 // duration fuzzy matching needed since the lookup is exact.
 
 async function fetchMuzoStream(videoId) {
   const response = await fetch(
-    `https://secret.com/api/stream?id=${encodeURIComponent(videoId)}`
+    `https://shashwatidr-casquad.hf.space/api/stream?id=${encodeURIComponent(videoId)}`
   );
 
   if (!response.ok) {
